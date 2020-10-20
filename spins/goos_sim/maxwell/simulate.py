@@ -45,6 +45,77 @@ class SimSourceImpl:
     def before_sim(self, sim: FdfdSimProp) -> None:
         pass
 
+@goos.polymorphic_model()
+class LaguerreGaussianSource(SimSource):
+    """Represents a laguerre gaussian source.
+
+    Attributes:
+        type: Must be "source.gaussian_beam".
+        normalize_by_sim: If `True`, normalize the power by running a
+            simulation.
+    """
+    type = goos.ModelNameType("source.laguerre_gaussian_beam")
+    w0 = goos.types.FloatType()
+    center = goos.Vec3d()
+    beam_center = goos.Vec3d()
+    extents = goos.Vec3d()
+    normal = goos.Vec3d()
+    theta = goos.types.FloatType()
+    psi = goos.types.FloatType()
+    m = goos.types.IntType()
+    p = goos.types.IntType()
+    polarization_angle = goos.types.FloatType()
+    power = goos.types.FloatType()
+    normalize_by_sim = goos.types.BooleanType(default=False)
+
+@maxwell.register(LaguerreGaussianSource)
+class LaguerreGaussianSourceImpl(SimSourceImpl):
+
+    def __init__(self, params: LaguerreGaussianSource) -> None:
+        """Creates a Laguerre Gaussian beam source.
+
+        Args:
+            params: Laguerre Gaussian beam source parameters.
+        """
+        self._params = params
+
+    def before_sim(self, sim: FdfdSimProp) -> None:
+        beam_center = self._params.beam_center
+        if beam_center is None:
+            beam_center = self._params.center
+
+        eps_grid = copy.deepcopy(sim.grid)
+        eps_grid.grids = sim.eps
+
+        source, _ = fdfd_tools.free_space_sources.build_laguerre_gaussian_source(
+            omega=2 * np.pi / sim.wlen,
+            eps_grid=eps_grid,
+            mu=None,
+            axis=gridlock.axisvec2axis(self._params.normal),
+            polarity=gridlock.axisvec2polarity(self._params.normal),
+            slices=simspace.create_region_slices(sim.grid.exyz,
+                                                 self._params.center,
+                                                 self._params.extents),
+            theta=self._params.theta,
+            psi=self._params.psi,
+            polarization_angle=self._params.polarization_angle,
+            w0=self._params.w0,
+            center=beam_center,
+            m = self._params.m,
+            p = self._params.p,
+            power=self._params.power)
+
+        if self._params.normalize_by_sim:
+            source = fdfd_tools.free_space_sources.normalize_source_by_sim(
+                omega=2 * np.pi / sim.wlen,
+                source=source,
+                eps=sim.eps,
+                dxes=sim.dxes,
+                pml_layers=sim.pml_layers,
+                solver=sim.solver,
+                power=self._params.power)
+
+        sim.source += source
 
 @goos.polymorphic_model()
 class GaussianSource(SimSource):
@@ -517,7 +588,7 @@ class SimulateNode(goos.ArrayFlowOpMixin, goos.ProblemGraphNode):
 
             for out in self._outputs:
                 out.before_sim(sim)
-
+            print("进行正向仿真！！！")
             fields = self._solver.solve(
                 omega=2 * np.pi / sim.wlen,
                 dxes=sim.dxes,
@@ -552,7 +623,7 @@ class SimulateNode(goos.ArrayFlowOpMixin, goos.ProblemGraphNode):
         omega = 2 * np.pi / sim.wlen
         for out, g in zip(self._outputs, grad_val.flows_grad):
             out.before_adjoint_sim(sim, g)
-
+        print("进行伴随仿真！！！")
         adjoint_fields = self._solver.solve(
             omega=2 * np.pi / sim.wlen,
             dxes=sim.dxes,
