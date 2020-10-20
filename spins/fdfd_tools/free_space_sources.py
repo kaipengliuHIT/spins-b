@@ -3,7 +3,8 @@ import copy
 from typing import Callable, List
 
 import numpy as np
-
+import math
+from math import factorial
 from spins import fdfd_tools
 from spins.fdfd_solvers import waveguide_mode
 from spins.fdfd_tools import vec, unvec
@@ -64,6 +65,47 @@ def gaussian_beam_z_axis_x_pol(x_grid, y_grid, z_grid, w0, center, R, omega,
         *(w0/w_z)*np.exp(-r2/w_z**2)*np.exp(-1j*polarity
         *(k*z+k*inv_R_z*(r2/2)-gouy_z))
 
+def laguerre(p, l, x):
+    result = 0
+    if p == 0:
+        result = 1
+    elif p == 1:
+        result = 1+ np.abs(l) - x
+    else :
+        result = (1/p)*((2*p+l-1-x)*laguerre(p-1,np.abs(l),x)-(p+l-1)*laguerre(p-2,np.abs(l),x))
+    return result
+
+def laguerre_gaussian_beam_z_axis_x_pol(x_grid, y_grid, z_grid, w0, center, R, omega, m, p,
+                               polarity, eps_val) -> complex:
+    """Scalar laguerre gaussian beam.
+    """
+    x = R[0, 0] * (x_grid - center[0]) + R[0, 1] * (
+        y_grid - center[1]) + R[0, 2] * (z_grid - center[2])
+    y = R[1, 0] * (x_grid - center[0]) + R[1, 1] * (
+        y_grid - center[1]) + R[1, 2] * (z_grid - center[2])
+    z = R[2, 0] * (x_grid - center[0]) + R[2, 1] * (
+        y_grid - center[1]) + R[2, 2] * (z_grid - center[2])
+
+    wlen = 2.0 * np.pi / (omega * np.sqrt(eps_val))
+    k = 2.0 * np.pi / wlen
+    z_r = np.pi * w0**2 / wlen  # raleigh length
+    w_z = w0 * (1 + (z / z_r)**2)**0.5  # beam waist as a function of z
+    inv_R_z = np.zeros_like(z_grid)
+    inv_R_z[z != 0] = np.power(z[z != 0] * (1 + (z_r / z[z != 0])**2), -1)
+    gouy_z = np.arctan(z / z_r)  # gouy phase
+    r2 = x**2 + y**2
+    r = np.sqrt(r2)
+    theta = np.arctan2(y,x)
+    imp = np.sqrt(1 / eps_val)
+    
+    #E2 = sqrt(2*factorial(p)/pi/(p+factorial(abs(m))))*(1/w_z)*(sqrt(2)*r/w_z).^abs(m)...
+    #    .*exp(-r.^2/w_z^2).*laguerre(p,abs(m),2*r.^2/w_z^2).*exp(-1i*m*theta).*exp(-1i*k*z)...
+    #    .*exp(-1i*k*r.^2*z/2/(z^2+Z_R^2))*exp(-1i*(2*p+abs(m)+1)*atan(z/Z_R));
+
+    #normalize power to 1
+    return np.sqrt(imp)*np.sqrt(2*factorial(p)/np.pi/(p+factorial(np.abs(m))))*(1/w_z)*(np.sqrt(2)*r/w_z)**(np.abs(m))\
+        *np.exp(-r2/(w_z**2))*laguerre(p,np.abs(m),2*r2/(w_z**2))*np.exp(-1j*m*theta)\
+            *np.exp(-1j*polarity*(k*z+k*inv_R_z*(r2/2)-gouy_z))*np.exp(-1j*(2*p+np.abs(m)+1))
 
 def plane_wave_z_axis_x_pol(x_grid, y_grid, z_grid, R, omega, polarity,
                             eps_val) -> complex:
@@ -402,6 +444,96 @@ def build_gaussian_source(eps_grid: Grid,
     eps_val = np.real(np.average(eps_grid.grids[0][tuple(slices)]))
     scalar_field_function = lambda x, y, z, R: gaussian_beam_z_axis_x_pol(
         x, y, z, w0, center, R, omega, polarity, eps_val)
+
+    # Get vector fields.
+    fields = scalar2rotated_vector_fields(
+        eps_grid=eps_grid,
+        scalar_field_function=scalar_field_function,
+        mu=mu,
+        omega=omega,
+        axis=axis,
+        slices=slices,
+        theta=theta,
+        psi=psi,
+        polarization_angle=polarization_angle,
+        polarity=polarity,
+        power=power,
+        full_fields=True)
+
+    # Calculate the source.
+    dxes = [eps_grid.dxyz, eps_grid.autoshifted_dxyz()]
+
+    # make current
+    field_slices = [slice(None, None)] * 3
+    J_slices = slices
+    if polarity == -1:
+        ind = slices[axis].start
+        field_slices[axis] = slice(None, ind)
+        J_slices[axis] = slice(ind - 1, ind + 1)
+    else:
+        ind = slices[axis].stop - 1
+        field_slices[axis] = slice(ind, None)
+        J_slices[axis] = slice(ind - 1, ind + 1)
+    E = np.zeros_like(fields['E'])
+    for i in range(3):
+        E[i][tuple(field_slices)] = fields['E'][i][tuple(field_slices)]
+
+    full = operators.e_full(omega,
+                            dxes,
+                            vec(eps_grid.grids),
+                            bloch_vec=fields['wavevector'])
+    J_vec = 1 / (-1j * omega) * full @ vec(E)
+    J_temp = unvec(J_vec, E[0].shape)
+    J = np.zeros_like(J_temp)
+    for i in range(3):
+        J[i][tuple(J_slices)] = J_temp[i][tuple(J_slices)]
+
+    return J, fields['wavevector']
+
+
+def build_laguerre_gaussian_source(eps_grid: Grid,
+                          omega: float,
+                          w0: float,
+                          center: np.ndarray,
+                          axis: int,
+                          slices=List[slice],
+                          mu: List[np.ndarray] = None,
+                          theta: float = 0,
+                          psi: float = 0,
+                          polarization_angle: float = 0,
+                          m: int = 0,
+                          p : int = 0,
+                          polarity: int = 1,
+                          power: float = 1):
+    """Builds a laguerre gaussian beam source.
+
+    By default, the laguerre gaussian beam propagates along polarity of the given axis and
+    is linearly polarized along the x-direction if axis is z, y-direction if x and
+    z direction if y. `theta` rotates the propagation direction around the E-field,
+    then 'psi' rotates source plane normal, and the polarization_angle rotates around
+    the propagation direction.
+
+    Args:
+        eps_grid: gridlock.grid with the permittivity distribution.
+        omega: The frequency of the mode.
+        axis: Direction of propagation.
+        slices: Source slice which define the position of the source in the grid.
+        mu: Permeability distribution.
+        theta: Rotation around the default E-component.
+        psi: Rotation around the source plane normal.
+        polarization_angle: Rotation around the propagation direction.
+        m : parameters of the  laguerre gaussian beam
+        p : parameters of the  laguerre gaussian beam
+        polarity: 1 if forward propagating. -1 if backward propagating.
+        power: Power is the gaussian beam.
+
+    Returns:
+        Current source J.
+    """
+    # Make scalar fields.
+    eps_val = np.real(np.average(eps_grid.grids[0][tuple(slices)]))
+    scalar_field_function = lambda x, y, z, R: laguerre_gaussian_beam_z_axis_x_pol(
+        x, y, z, w0, center, R, omega, m, p, polarity, eps_val)
 
     # Get vector fields.
     fields = scalar2rotated_vector_fields(
